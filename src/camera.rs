@@ -11,6 +11,9 @@ pub struct Camera {
     lens_radius: f32,
 }
 
+unsafe impl Send for Camera {}
+unsafe impl Sync for Camera {}
+
 impl Camera {
     pub fn new(look_from: &Vec3, look_at: &Vec3, up: &Vec3, v_fov: f32, aspect: f32, aperture: f32, focal_distance: f32) -> Self {
 

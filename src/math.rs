@@ -201,3 +201,11 @@ impl Ray {
 pub fn random() -> f32 {
     gen_range(0.0, 1.0)
 }
+
+
+pub struct Rect {
+    pub x: f32,
+    pub y: f32, 
+    pub w: f32,
+    pub h: f32
+}

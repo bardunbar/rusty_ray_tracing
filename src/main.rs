@@ -1,17 +1,28 @@
-use camera::Camera;
-use miniquad::*;
 
 mod math;
 mod camera;
 mod material;
 
+use image::Rgb;
+use math::Rect;
+use miniquad::*;
+use camera::Camera;
+use chrono::Local;
 use math::Vec3;
 use math::Ray;
 use math::random;
-use chrono::Local;
+use quad_rand::ChooseRandom;
 use material::Material;
 use material::MaterialParams;
-use std::thread::available_parallelism;
+use std::sync::RwLock;
+use std::thread::JoinHandle;
+use std::{
+    thread,
+    sync::{
+        Arc,
+        Mutex
+    }
+};
 use image::ImageBuffer;
 
 #[repr(C)]
@@ -91,6 +102,9 @@ impl Hitable for Sphere {
 pub struct World {
     objects: Vec<Box<dyn Hitable>>
 }
+
+unsafe impl Send for World {}
+unsafe impl Sync for World {}
 
 impl World {
     pub fn new() -> Self {
@@ -202,35 +216,99 @@ fn build_random_scene() -> World {
     world
 }
 
-const SCREEN_WIDTH: usize = 1024;
-const SCREEN_HEIGHT: usize = SCREEN_WIDTH / 2;
-
-const RENDER_WIDTH: usize = 1024;
-const RENDER_HEIGHT: usize = RENDER_WIDTH / 2;
-const LEN: usize = RENDER_WIDTH * RENDER_HEIGHT * 4;
-const SAMPLES: usize = 10;
-
-struct Application {
-    pipeline: Pipeline,
-    bindings: Bindings,
-    world: World,
-    camera: Camera,
-    pixel_buffer: Vec<u8>,
-    cur_x: usize,
-    cur_y: usize,
-    rendering: bool,
+#[derive(Clone)]
+pub struct RenderStats {
+    x: usize,
+    y: usize,
+    target_x: usize,
+    target_y: usize,
+    buffer_stride: usize,
+    done: bool,
 }
 
-impl Application {
-    fn new(ctx: &mut GraphicsContext) -> Self {
+fn worker(queue: Arc<Mutex<Vec<RenderJob>>>)
+{
+    let mut job;
+    while {
+        let mut job_queue = queue.lock().unwrap();
+        job = job_queue.pop();
+        job.is_some()
+    } {
+        if let Some(j) = job {
+            render_tile(j.buffer, j.stats, j.camera, j.world);
+        }
+    }
+} 
 
-        println!("Available thread count: {}", available_parallelism().unwrap().get());
+fn render_tile(pixels: Arc<Mutex<Vec<u8>>>, render_stats: RenderStats, camera: Arc<RwLock<Camera>>, world: Arc<RwLock<World>>) {
+    
+    let (sx, sy) = (render_stats.x, render_stats.y);
+    let (fx, fy) = (render_stats.target_x, render_stats.target_y);
+    let buffer_stride = render_stats.buffer_stride;
+
+    let camera_resource = camera.read().unwrap();
+    let world_resource = world.read().unwrap();
+
+    for y in sy..fy {
+        for x in sx..fx {
+            let mut pixel_color = Vec3::default();
+            for _ in 0..SAMPLES {
+
+                let u = ((x as f32) + random()) / (RENDER_WIDTH as f32);
+                let v = ((y as f32) + random()) / (RENDER_HEIGHT as f32); 
+
+                let ray = camera_resource.get_ray(u, v);
+                pixel_color += color(&ray, &*world_resource, 0);
+            }
+
+            pixel_color /= SAMPLES as f32;
+            pixel_color = Vec3::new(f32::sqrt(pixel_color.x), f32::sqrt(pixel_color.y), f32::sqrt(pixel_color.z));
+
+            let r = pixel_color.x;
+            let g = pixel_color.y;
+            let b = pixel_color.z;
+
+            let iy = y - sy;
+            let ix = x - sx;
+
+            {
+                let mut data = pixels.lock().unwrap();
+
+                data[buffer_stride * iy + (ix * 4) + 0] = (256.0 * r) as u8;
+                data[buffer_stride * iy + (ix * 4) + 1] = (256.0 * g) as u8;
+                data[buffer_stride * iy + (ix * 4) + 2] = (256.0 * b) as u8;
+                data[buffer_stride * iy + (ix * 4) + 3] = 0xFF;
+            }
+        }
+    }
+}
+
+pub struct RenderJob {
+    pub buffer: Arc<Mutex<Vec<u8>>>,
+    pub stats: RenderStats, 
+    pub camera: Arc<RwLock<Camera>>,
+    pub world: Arc<RwLock<World>>,
+}
+
+pub struct Tile {
+    pixel_buffer: Arc<Mutex<Vec<u8>>>,
+    bindings: Bindings,
+    progress: RenderStats,
+}
+
+impl Tile {
+    fn new(ctx: &mut GraphicsContext, tile_rect: Rect) -> Tile {
+        let (vx1, vx2, vy1, vy2) = (
+            (tile_rect.x / RENDER_WIDTH as f32) * 2.0 - 1.0,
+            ((tile_rect.x + tile_rect.w) / RENDER_WIDTH as f32) * 2.0 - 1.0,
+            (tile_rect.y / RENDER_HEIGHT as f32) * 2.0 - 1.0,
+            ((tile_rect.y + tile_rect.h) / RENDER_HEIGHT as f32) * 2.0 - 1.0);
 
         let vertices: [Vertex; 4] = [
-            Vertex { pos : Vec2 { x: -1.0, y: -1.0 }, uv: Vec2 { x: 0., y: 0. } },
-            Vertex { pos : Vec2 { x:  1.0, y: -1.0 }, uv: Vec2 { x: 1., y: 0. } },
-            Vertex { pos : Vec2 { x:  1.0, y:  1.0 }, uv: Vec2 { x: 1., y: 1. } },
-            Vertex { pos : Vec2 { x: -1.0, y:  1.0 }, uv: Vec2 { x: 0., y: 1. } },
+            Vertex { pos : Vec2 { x: vx1, y: vy1 }, uv: Vec2 { x: 0., y: 0. } },
+            Vertex { pos : Vec2 { x:  vx2, y: vy1 }, uv: Vec2 { x: 1., y: 0. } },
+            Vertex { pos : Vec2 { x:  vx2, y:  vy2 }, uv: Vec2 { x: 1., y: 1. } },
+            Vertex { pos : Vec2 { x: vx1, y:  vy2 }, uv: Vec2 { x: 0., y: 1. } },
         ];
 
         let vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &vertices);
@@ -238,16 +316,65 @@ impl Application {
         let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
         let index_buffer = Buffer::immutable(ctx, BufferType::IndexBuffer, &indices);
 
-        let world = build_random_scene();
-
-        let pixels = vec![0; LEN];
-        let texture = Texture::from_rgba8(ctx, RENDER_WIDTH as u16, RENDER_HEIGHT as u16, &pixels);
+        let pixels = vec![0; tile_rect.w as usize * tile_rect.h as usize * 4];
+        let texture = Texture::from_rgba8(ctx, tile_rect.w as u16, tile_rect.h as u16, &pixels);
 
         let bindings = Bindings {
             vertex_buffers: vec![vertex_buffer],
             index_buffer: index_buffer,
             images: vec![texture],
         };
+
+        let mutex = Mutex::new(pixels);
+        let arc = Arc::new(mutex);
+
+        Tile {
+            progress: RenderStats { 
+                x: tile_rect.x as usize, 
+                y: tile_rect.y as usize, 
+                target_x: tile_rect.x as usize + tile_rect.w as usize, 
+                target_y: tile_rect.y as usize + tile_rect.h as usize, 
+                buffer_stride: tile_rect.w as usize * 4, 
+                done: false },
+            pixel_buffer: arc,
+            bindings,
+        }
+    }
+
+    pub fn render(&self, ctx: &mut GraphicsContext) {
+        ctx.apply_bindings(&self.bindings);
+        ctx.draw(0, 6, 1);
+    }
+}
+
+const TILE_DIM: usize = 64;
+const TILE_WIDTH: usize = 16;
+const TILE_HEIGHT: usize = TILE_WIDTH / 2;
+
+const SCREEN_WIDTH: usize = 1024;
+const SCREEN_HEIGHT: usize = SCREEN_WIDTH / 2;
+
+const RENDER_WIDTH: usize = TILE_WIDTH * TILE_DIM;
+const RENDER_HEIGHT: usize = TILE_HEIGHT * TILE_DIM;
+const SAMPLES: usize = 100;
+const THREAD_COUNT: usize = 10;
+
+struct Application {
+    pipeline: Pipeline,
+    tiles: Vec<Tile>,
+    workers: Vec<JoinHandle<()>>,
+    rendering: bool,
+}
+
+impl Application {
+    fn new(ctx: &mut GraphicsContext) -> Self {
+
+        // println!("Available thread count: {}", thread::available_parallelism().unwrap().get());
+
+        let world = build_random_scene();
+        let world_lock = RwLock::new(world);
+        let world_resource = Arc::new(world_lock);
+
 
         let shader = Shader::new(ctx, shader::VERTEX, shader::FRAGMENT, shader::meta()).unwrap();
 
@@ -265,22 +392,67 @@ impl Application {
         let look_at = Vec3::new(0.0, 0.5, 0.0);
         let dist = (look_from - look_at).length();
 
+        let camera = Camera::new(
+            &look_from, 
+            &look_at, 
+            &Vec3::new(0.0, 1.0, 0.0), 
+        20.0, 
+            SCREEN_WIDTH as f32 / SCREEN_HEIGHT as f32,
+            0.25, 
+            dist
+        );
+        let camera_lock = RwLock::new(camera);
+        let camera_resource = Arc::new(camera_lock);
+
+        // Create all the tiles to render
+        let mut tiles = Vec::new();
+        for x in 0..TILE_WIDTH {
+            for y in 0..TILE_HEIGHT {
+                let tile = Tile::new(ctx, Rect {
+                    x: (x * TILE_DIM) as f32,
+                    y: (y * TILE_DIM) as f32,
+                    w: TILE_DIM as f32,
+                    h: TILE_DIM as f32,
+                });
+
+                tiles.push(tile);
+            }
+        }
+
+        // Shuffle the tiles to make the render look more interesting!
+        tiles.shuffle();
+
+        // Create a render job for each tile
+        let mut jobs = Vec::new();
+        for tile in tiles.iter() {
+            let job = RenderJob {
+                buffer: tile.pixel_buffer.clone(),
+                stats: tile.progress.clone(),
+                camera: camera_resource.clone(),
+                world: world_resource.clone(),
+            };
+
+            jobs.push(job);
+        }
+
+        let jobs_lock = Mutex::new(jobs);
+        let jobs_resource = Arc::new(jobs_lock);
+
+        let mut workers = Vec::new();
+        for _ in 0..THREAD_COUNT {
+            let job_clone = jobs_resource.clone();
+
+            let t = thread::spawn(move ||{
+                worker(job_clone);
+            });
+            workers.push(t);
+        }
+
+
         Application {
             pipeline,
-            bindings,
-            world,
-            camera: Camera::new(
-                &look_from, 
-                &look_at, 
-                &Vec3::new(0.0, 1.0, 0.0), 
-            20.0, 
-                SCREEN_WIDTH as f32 / SCREEN_HEIGHT as f32,
-                0.25, 
-                dist
-            ),
-            pixel_buffer: pixels,
-            cur_x: 0,
-            cur_y: 0,
+            workers,
+            tiles,
             rendering: true
         }
     }
@@ -289,78 +461,55 @@ impl Application {
 impl EventHandler for Application {
     
     fn update(&mut self, ctx: &mut Context) {
-        use std::time::Instant;
 
         if self.rendering {
-            let start_time = Instant::now();
-            let mut stop_flag = false;
-            for y in self.cur_y..RENDER_HEIGHT {
-                for x in self.cur_x..RENDER_WIDTH {
-                    let mut pixel_color = Vec3::default();
-                    for _ in 0..SAMPLES {
-    
-                        let u = ((x as f32) + random()) / (RENDER_WIDTH as f32);
-                        let v = ((y as f32) + random()) / (RENDER_HEIGHT as f32); 
-        
-                        let ray = self.camera.get_ray(u, v);
-                        pixel_color += color(&ray, &self.world, 0);
-                    }
-    
-                    pixel_color /= SAMPLES as f32;
-                    pixel_color = Vec3::new(f32::sqrt(pixel_color.x), f32::sqrt(pixel_color.y), f32::sqrt(pixel_color.z));
-    
-                    let r = pixel_color.x;
-                    let g = pixel_color.y;
-                    let b = pixel_color.z;
-    
-                    self.pixel_buffer[(RENDER_WIDTH * 4) * y + (x * 4) + 0] = (256.0 * r) as u8;
-                    self.pixel_buffer[(RENDER_WIDTH * 4) * y + (x * 4) + 1] = (256.0 * g) as u8;
-                    self.pixel_buffer[(RENDER_WIDTH * 4) * y + (x * 4) + 2] = (256.0 * b) as u8;
-                    self.pixel_buffer[(RENDER_WIDTH * 4) * y + (x * 4) + 3] = 0xFF;
 
-                    self.cur_x = x + 1;
+            thread::sleep(std::time::Duration::from_millis(100));
 
-                    let current_time = Instant::now();
-                    let duration_ms = current_time.duration_since(start_time).as_millis();
+            for tile in self.tiles.iter_mut() {
+                if !tile.progress.done {
 
-                    stop_flag = duration_ms > 200;
-
-                    if stop_flag {
-                        break;
+                    {
+                        let pixels = tile.pixel_buffer.lock().unwrap();
+                        let texture = &tile.bindings.images[0]; 
+                        texture.update(ctx, &pixels);
                     }
                 }
-                
-                if stop_flag {
-                    break;
-                }
-
-                self.cur_x = 0;
-                self.cur_y = y + 1;
             }
-    
-            if self.rendering && !stop_flag {
+            let mut all_done = true;
+            for worker in self.workers.iter() {
+                all_done = all_done && worker.is_finished();
+            }
+            
+            if self.rendering && all_done {
                 self.rendering = false;
  
-                
-
                 let mut buff = ImageBuffer::new(RENDER_WIDTH as u32, RENDER_HEIGHT as u32);
-                for (x, y, pixel) in buff.enumerate_pixels_mut() {
-                    let inv_y = RENDER_HEIGHT - 1 - y as usize;
-                    let r = self.pixel_buffer[inv_y as usize * (RENDER_WIDTH * 4) + (x as usize * 4) + 0];
-                    let g = self.pixel_buffer[inv_y as usize * (RENDER_WIDTH * 4) + (x as usize * 4) + 1];
-                    let b = self.pixel_buffer[inv_y as usize * (RENDER_WIDTH * 4) + (x as usize * 4) + 2];
-                    *pixel = image::Rgb([r, g, b]);
+                
+                for tile in self.tiles.iter() {
+                    let pixels = tile.pixel_buffer.lock().unwrap();
+                    let stats = &tile.progress;
+                    
+                    for y in 0..TILE_DIM {
+                        for x in 0..TILE_DIM {
+                            let r = pixels[stats.buffer_stride * y + x * 4 + 0];
+                            let g = pixels[stats.buffer_stride * y + x * 4 + 1];
+                            let b = pixels[stats.buffer_stride * y + x * 4 + 2];
+
+                            let pixel_x = (x + stats.x) as u32;
+                            let pixel_y = ((RENDER_HEIGHT - 1) - (y + stats.y)) as u32; // Invert the Y to accommodate the image crate's format
+
+                            buff.put_pixel(pixel_x, pixel_y, Rgb([r,g,b]));
+                        }
+                    }
                 }
 
                 let dt = Local::now();
                 let file_path = format!("output_{}.png", dt.format("%Y%m%d%H%M%S"));
-
                 buff.save_with_format(file_path, image::ImageFormat::Png).unwrap()
                 
             }
 
-            let texture = &self.bindings.images[0]; 
-            texture.update(ctx, &self.pixel_buffer);
         }
     }
 
@@ -368,9 +517,10 @@ impl EventHandler for Application {
         ctx.begin_default_pass(Default::default());
 
         ctx.apply_pipeline(&self.pipeline);
-        ctx.apply_bindings(&self.bindings);
 
-        ctx.draw(0, 6, 1);
+        for tile in self.tiles.iter() {
+            tile.render(ctx);
+        }
 
         ctx.end_render_pass();
 
