@@ -3,26 +3,27 @@ mod math;
 mod camera;
 mod material;
 
-use image::Rgb;
-use math::Rect;
-use miniquad::*;
-use camera::Camera;
-use chrono::Local;
-use math::Vec3;
-use math::Ray;
-use math::random;
-use quad_rand::ChooseRandom;
-use material::Material;
-use material::MaterialParams;
-use std::sync::RwLock;
-use std::thread::JoinHandle;
+use std::thread;
 use std::{
-    thread,
+    time::Instant,
+    thread::{
+        JoinHandle,
+    },
     sync::{
         Arc,
-        Mutex
+        Mutex,
+        RwLock
     }
 };
+
+use chrono::{ Duration, Local };
+use image::Rgb;
+use miniquad::*;
+use quad_rand::ChooseRandom;
+
+use math::{Vec3, Rect, Ray, random};
+use camera::Camera;
+use material::{ MaterialParams, Material };
 use image::ImageBuffer;
 
 #[repr(C)]
@@ -356,14 +357,15 @@ const SCREEN_HEIGHT: usize = SCREEN_WIDTH / 2;
 
 const RENDER_WIDTH: usize = TILE_WIDTH * TILE_DIM;
 const RENDER_HEIGHT: usize = TILE_HEIGHT * TILE_DIM;
-const SAMPLES: usize = 100;
-const THREAD_COUNT: usize = 10;
+const SAMPLES: usize = 1000;
+const THREAD_COUNT: usize = 15;
 
 struct Application {
     pipeline: Pipeline,
     tiles: Vec<Tile>,
     workers: Vec<JoinHandle<()>>,
     rendering: bool,
+    start_time: Instant,
 }
 
 impl Application {
@@ -438,8 +440,16 @@ impl Application {
         let jobs_lock = Mutex::new(jobs);
         let jobs_resource = Arc::new(jobs_lock);
 
+        // Attempt to use as many threads as are available, leaving one for the main thread.
+        let thread_count = match thread::available_parallelism() {
+            Ok(system_threads) => system_threads.get() - 1,
+            Err(_) => THREAD_COUNT,
+        };
+
+        println!("Begin render using {} core{}.", thread_count, if thread_count == 1 { "" } else {"s"} );
+
         let mut workers = Vec::new();
-        for _ in 0..THREAD_COUNT {
+        for _ in 0..thread_count {
             let job_clone = jobs_resource.clone();
 
             let t = thread::spawn(move ||{
@@ -453,7 +463,8 @@ impl Application {
             pipeline,
             workers,
             tiles,
-            rendering: true
+            rendering: true,
+            start_time: Instant::now(),
         }
     }
 }
@@ -483,6 +494,16 @@ impl EventHandler for Application {
             
             if self.rendering && all_done {
                 self.rendering = false;
+
+                let finish_time = Instant::now();
+
+                if let Ok(render_time) = Duration::from_std(finish_time.duration_since(self.start_time)) {
+                    let hours = render_time.num_hours();
+                    let minutes = render_time.num_minutes() % 60;
+                    let seconds = render_time.num_seconds() % 60;
+                    let milliseconds = render_time.num_milliseconds() % 1000;
+                    println!("Render complete in {:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, milliseconds);
+                }
  
                 let mut buff = ImageBuffer::new(RENDER_WIDTH as u32, RENDER_HEIGHT as u32);
                 
